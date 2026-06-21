@@ -43,7 +43,7 @@ ENV APP_BUILD_HASH=${BUILD_HASH}
 RUN npm run build
 
 ######## WebUI backend ########
-FROM python:3.11-slim-bookworm AS base
+FROM python:3.11.14-slim-bookworm AS base
 
 # Use args
 ARG USE_CUDA
@@ -135,9 +135,6 @@ RUN apt-get update && \
 # install python dependencies
 COPY --chown=$UID:$GID ./backend/requirements.txt ./requirements.txt
 
-# Set UV_LINK_MODE to copy to prevent 0-byte file corruption in QEMU arm64 cross-builds
-ENV UV_LINK_MODE=copy
-
 RUN set -e; \
     pip3 install --no-cache-dir uv; \
     if [ "$USE_CUDA" = "true" ]; then \
@@ -163,6 +160,38 @@ RUN set -e; \
     fi; \
     mkdir -p /app/backend/data; chown -R $UID:$GID /app/backend/data/; \
     rm -rf /var/lib/apt/lists/*;
+
+# ───────────────────────────────────────────────────────────
+# Bonnell (x86-64-v1) rebuild — Atom D525, no SSE4.x/AVX
+# ───────────────────────────────────────────────────────────
+# Pre-built wheels in bonnell-build/bonnell-wheels/ replace
+# the manylinux ones for numpy, pyarrow, and tokenizers.
+# Pre-built .so libs in bonnell-build/arrow-libs/ provide the
+# Bonnell-safe libarrow runtime.
+# Other SIMD-heavy packages (scipy, opencv, torch, etc.)
+# are controlled at runtime via env vars below.
+# ───────────────────────────────────────────────────────────
+COPY --chown=$UID:$GID ./bonnell-build/bonnell-wheels /tmp/bonnell-wheels
+COPY --chown=$UID:$GID ./bonnell-build/arrow-libs /usr/local/lib
+
+RUN pip3 install --no-cache-dir --force-reinstall --no-deps \
+    /tmp/bonnell-wheels/numpy-2.4.6-cp311-cp311-linux_x86_64.whl \
+    /tmp/bonnell-wheels/pyarrow-18.1.0-cp311-cp311-linux_x86_64.whl \
+    /tmp/bonnell-wheels/tokenizers-0.22.2-cp39-abi3-linux_x86_64.whl && \
+    sed -i 's/__version__ = None/__version__ = "18.1.0"/' \
+    /usr/local/lib/python3.11/site-packages/pyarrow/__init__.py && \
+    rm -rf /tmp/bonnell-wheels && \
+    ldconfig
+
+# Runtime SIMD controls for pre-built packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libopenblas0 libre2-9 libthrift-0.17.0 libutf8proc2 && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV NPY_DISABLE_CPU_FEATURES="AVX,AVX2,AVX512F,FMA3,FMA4,SSE4_1,SSE4_2,POPCNT" \
+    OPENBLAS_CORETYPE="BONNELL" \
+    ARROW_USER_SIMD_LEVEL="NONE" \
+    OPENCV_CPU_DISABLE="AVX2,AVX,SSE4.2,SSE4.1,SSSE3,SSE3"
 
 # Install Ollama if requested
 RUN if [ "$USE_OLLAMA" = "true" ]; then \

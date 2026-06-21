@@ -1,0 +1,92 @@
+# syntax=docker/dockerfile:1
+# Build Bonnell-safe wheels inside the official base image (Python 3.11)
+FROM python:3.11-slim-bookworm
+
+WORKDIR /build
+
+# ── System deps ────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git cmake ninja-build pkg-config g++ make \
+    libopenblas-dev libatlas-base-dev gfortran \
+    libssl-dev libcurl4-openssl-dev liblz4-dev libzstd-dev \
+    libbrotli-dev libsnappy-dev libboost-dev \
+    libre2-dev libthrift-dev libutf8proc-dev \
+    libgflags-dev libgoogle-glog-dev libprotobuf-dev protobuf-compiler \
+    rapidjson-dev libdouble-conversion-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Rust (for tokenizers) ───────────────────────────────
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# ── Python build deps ───────────────────────────────────
+RUN pip3 install --no-cache-dir setuptools wheel meson-python Cython \
+    pybind11 maturin pythran patchelf
+
+# ── Arrow C++ + pyarrow (must be one RUN — pyarrow needs the source tree) ─
+WORKDIR /tmp
+RUN git clone --depth 1 --branch apache-arrow-18.1.0 \
+    https://github.com/apache/arrow.git /tmp/arrow-src && \
+    mkdir -p /tmp/arrow-src/cpp/build && cd /tmp/arrow-src/cpp/build && \
+    cmake .. -GNinja \
+    -DCMAKE_C_FLAGS="-march=x86-64 -mtune=generic -O2" \
+    -DCMAKE_CXX_FLAGS="-march=x86-64 -mtune=generic -O2" \
+    -DARROW_SIMD_LEVEL=NONE \
+    -DARROW_RUNTIME_SIMD_LEVEL=NONE \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DARROW_DEPENDENCY_SOURCE=AUTO \
+    -DARROW_PARQUET=ON \
+    -DARROW_DATASET=ON \
+    -DARROW_CSV=ON \
+    -DARROW_JSON=ON \
+    -DARROW_JEMALLOC=OFF \
+    -DARROW_BUILD_TESTS=OFF \
+    -DARROW_BUILD_BENCHMARKS=OFF \
+    -DARROW_BUILD_UTILITIES=OFF \
+    -DARROW_FLIGHT=OFF \
+    -DARROW_GANDIVA=OFF \
+    -DARROW_ORC=OFF \
+    -DARROW_HDFS=OFF \
+    -DARROW_WITH_UCX=OFF \
+    -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    ninja -j"$(nproc)" && ninja install && ldconfig && \
+    echo "=== Arrow C++ done, building pyarrow ===" && \
+    cd /tmp/arrow-src/python && \
+    ARROW_HOME=/usr/local PYARROW_WITH_SYSTEM_ARROW=1 \
+    CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)" \
+    CFLAGS="-march=x86-64 -mtune=generic -O2" \
+    CXXFLAGS="-march=x86-64 -mtune=generic -O2" \
+    PYARROW_CMAKE_OPTIONS="-DARROW_SIMD_LEVEL=NONE" \
+    pip3 wheel --no-build-isolation --no-cache-dir \
+    -w /build/wheels/ . && \
+    ls -la /build/wheels/pyarrow* && \
+    cd /build/wheels && \
+    mv pyarrow-0.0.0-cp311-cp311-linux_x86_64.whl \
+       pyarrow-18.1.0-cp311-cp311-linux_x86_64.whl && \
+    echo "=== patching version in wheel ===" && \
+    mkdir -p /tmp/patch-pyarrow && cd /tmp/patch-pyarrow && \
+    unzip -q /build/wheels/pyarrow-18.1.0-cp311-cp311-linux_x86_64.whl && \
+    sed -i 's/__version__ = None/__version__ = "18.1.0"/' \
+        pyarrow/__init__.py && \
+    zip -q /build/wheels/pyarrow-18.1.0-cp311-cp311-linux_x86_64.whl \
+        -r . && \
+    cd /build/wheels && rm -rf /tmp/patch-pyarrow && \
+    rm -rf /tmp/arrow-src && \
+    echo "=== pyarrow done, wheel: pyarrow-18.1.0-cp311-cp311-linux_x86_64.whl ==="
+
+# ── numpy ───────────────────────────────────────────────
+RUN MAKEFLAGS="-j$(nproc)" && \
+    CFLAGS="-march=x86-64 -mtune=generic -O2" && \
+    CXXFLAGS="-march=x86-64 -mtune=generic -O2" && \
+    pip3 wheel --no-build-isolation --no-cache-dir --no-binary numpy \
+    -w /build/wheels/ numpy \
+    -Csetup-args=-Dcpu-baseline="none" \
+    -Csetup-args=-Ddisable-optimization=true
+
+# ── tokenizers ──────────────────────────────────────────
+RUN pip3 install puccinialin && \
+    CARGO_BUILD_RUSTFLAGS="-C target-cpu=x86-64" \
+    pip3 wheel --no-build-isolation --no-cache-dir --no-binary tokenizers \
+    -w /build/wheels/ tokenizers==0.22.2
+
+CMD ["sh", "-c", "echo 'Built wheels:'; ls -lh /build/wheels/"]
