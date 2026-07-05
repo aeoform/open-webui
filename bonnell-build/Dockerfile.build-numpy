@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1
+# ── Bonnell (x86-64-v1) wheel builder: numpy ─────────────
+# Produces a numpy wheel with cpu-baseline=none so no
+# SSE4.x / AVX instructions are emitted.
+#
+# IMPORTANT: The build host likely has full SIMD (SSE4/AVX).
+# We must explicitly restrict the compiler to x86-64 baseline
+# so the resulting wheel runs on Bonnell (Atom D525).
+# ─────────────────────────────────────────────────────────
+ARG BASE_IMAGE=python:3.11.14-slim-bookworm
+FROM ${BASE_IMAGE}
+
+WORKDIR /build
+
+# ── System build deps ───────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    g++ gfortran make ninja-build unzip binutils \
+    libopenblas-dev libatlas-base-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python build deps ───────────────────────────────────
+RUN pip3 install --no-cache-dir setuptools wheel meson-python Cython \
+    pythran patchelf
+
+# ── Force x86-64 baseline everywhere ────────────────────
+# ENV ensures any subprocess (meson, cython, etc.) sees these.
+# -march=x86-64 limits to SSE2 baseline; -mno-* is explicit
+# belt-and-suspenders in case any flag gets overridden.
+ENV CFLAGS="-march=x86-64 -mtune=generic -O2 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2" \
+    CXXFLAGS="-march=x86-64 -mtune=generic -O2 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2" \
+    LDFLAGS="-march=x86-64"
+
+# ── Build numpy from source ─────────────────────────────
+# No version pin — builds the latest numpy compatible with
+# Python 3.11.  The wheel filename will contain the version
+# automatically; the main Dockerfile uses glob patterns.
+RUN MAKEFLAGS="-j$(nproc)" \
+    pip3 wheel --no-build-isolation --no-cache-dir --no-binary numpy \
+    -w /build/wheels/ \
+    numpy \
+    -Csetup-args=-Dcpu-baseline="none" \
+    -Csetup-args=-Ddisable-optimization=true
+
+# ── Verify no SSE4/AVX ─────────────────────────────────
+RUN echo "=== Checking for SSE4/AVX instructions ===" && \
+    WHL=$(ls /build/wheels/numpy-*.whl | head -1) && \
+    mkdir -p /tmp/check-numpy && cd /tmp/check-numpy && \
+    unzip -q "$WHL" && \
+    find . -name "*.so" -exec sh -c \
+      'count=$(objdump -d {} | grep -cE "vpcmpeq|vzeroupper|pinsrq"); echo "{}: $count"' \; && \
+    rm -rf /tmp/check-numpy
+
+CMD ["sh", "-c", "echo 'Built wheels:'; ls -lh /build/wheels/"]

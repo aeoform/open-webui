@@ -7,108 +7,133 @@ Open WebUI 的 manylinux 预编译包默认要求 x86-64-v2（SSE4.2），在 Bo
 
 ## 整体策略
 
-- **3 个包源码重建**：numpy、pyarrow、tokenizers — 这三者无法用运行时环境变量完全控制 SIMD
+- **4 个包源码重建**：numpy、pyarrow、tokenizers、onnxruntime — 这些无法用运行时环境变量完全控制 SIMD
 - **其余包用 manylinux wheel**：scipy、sklearn、opencv、ctranslate2 等通过运行时环境变量控制 SIMD dispatch
 - **Arrow C++ .so 直接拷贝**：pyarrow 依赖的 libarrow 库从 builder 镜像复制到最终镜像
+- **每个依赖独立编译容器**：互不影响，某一个失败不需要重头再来
 
 ## 文件结构
 
 ```
 bonnell-build/
-├── Dockerfile.wheel-builder    # 在 python:3.11-slim-bookworm 内编译 wheel
-├── Dockerfile                  # Open WebUI 主 Dockerfile（含 Bonnell 段）
-├── README.md                   # 本文档
-├── bonnell-wheels/             # 编译产物: numpy, pyarrow, tokenizers 的 .whl
-└── arrow-libs/                 # 从 builder 拷出的 libarrow.so 等运行时库
+├── Dockerfile.build-numpy       # 独立编译 numpy
+├── Dockerfile.build-pyarrow     # 独立编译 Arrow C++ + pyarrow
+├── Dockerfile.build-tokenizers  # 独立编译 tokenizers
+├── Dockerfile.build-onnxruntime # 独立编译 onnxruntime
+├── README.md                    # 本文档
+├── bonnell-wheels/              # 编译产物: 所有 .whl 文件
+└── arrow-libs/                  # 从 pyarrow builder 拷出的 libarrow.so 等运行时库
 ```
 
 ## 构建步骤
 
-### 1. 构建 wheel-builder 镜像
+每个 Dockerfile 都是独立容器，可以按任意顺序构建。推荐先跑 numpy 和 tokenizers（快），再跑 pyarrow（中等），最后跑 onnxruntime（最慢，~1-2h）。
+
+### 1. 构建 numpy
 
 ```bash
-docker build --network=host --no-cache -t bonnell-wheel-builder \
-  -f bonnell-build/Dockerfile.wheel-builder \
+docker build --network=host --no-cache \
+  -t bonnell-build-numpy \
+  -f bonnell-build/Dockerfile.build-numpy \
   bonnell-build/
 ```
 
-镜像内部做的事（`Dockerfile.wheel-builder`）：
-- apt 安装编译依赖（g++、cmake、ninja、OpenBLAS、re2、thrift 等）
-- 安装 Rust（tokenizers 需要）
-- 从源码编译 **Arrow C++ 18.1.0**：
-  - `-DARROW_SIMD_LEVEL=NONE`
-  - `-DARROW_RUNTIME_SIMD_LEVEL=NONE`
-  - `-DCMAKE_CXX_FLAGS="-march=x86-64 -mtune=generic -O2"`
-- Arrow C++ 和 pyarrow 在同一个 RUN 中编译（pyarrow 需要 Arrow 源码树 + `PYARROW_CMAKE_OPTIONS="-DARROW_SIMD_LEVEL=NONE"`）
-- 从源码编译 **numpy**：`-Dcpu-baseline=none -Ddisable-optimization=true`
-- 从源码编译 **tokenizers**：`CARGO_BUILD_RUSTFLAGS="-C target-cpu=x86-64"`
-  - tokenizers 的 AVX 代码由 `is_x86_feature_detected!("avx2")` 运行时保护，Bonnell 不会调用
-
-### 2. 导出编译产物
+导出 wheel：
 
 ```bash
-# 导出 wheel
-ctr=$(docker create bonnell-wheel-builder)
-sudo rm -rf bonnell-build/bonnell-wheels && mkdir -p bonnell-build/bonnell-wheels
+ctr=$(docker create bonnell-build-numpy)
+mkdir -p bonnell-build/bonnell-wheels
 docker cp $ctr:/build/wheels/. bonnell-build/bonnell-wheels/
 docker rm $ctr
+```
 
-# 导出 Arrow C++ 运行时库（.so files）
-ctr=$(docker create bonnell-wheel-builder)
-sudo rm -rf bonnell-build/arrow-libs && mkdir -p bonnell-build/arrow-libs
-docker cp $ctr:/usr/local/lib/. bonnell-build/arrow-libs/
+### 2. 构建 pyarrow
+
+```bash
+docker build --network=host --no-cache \
+  -t bonnell-build-pyarrow \
+  --build-arg ARROW_VERSION=20.0.0 \
+  -f bonnell-build/Dockerfile.build-pyarrow \
+  bonnell-build/
+```
+
+导出 wheel + Arrow 运行时库：
+
+```bash
+ctr=$(docker create bonnell-build-pyarrow)
+mkdir -p bonnell-build/bonnell-wheels bonnell-build/arrow-libs
+docker cp $ctr:/build/wheels/. bonnell-build/bonnell-wheels/
+docker cp $ctr:/build/arrow-libs/. bonnell-build/arrow-libs/
 docker rm $ctr
 ```
 
-### 3. 验证 wheel 无 SSE4/AVX 指令
+### 3. 构建 tokenizers
 
 ```bash
-# numpy
-unzip -q bonnell-build/bonnell-wheels/numpy*.whl && \
-  objdump -d numpy/_core/_multiarray_umath*.so | grep -cE "vpcmpeq|vzeroupper|pinsrq"
-# 期望: 0
+docker build --network=host --no-cache \
+  -t bonnell-build-tokenizers \
+  -f bonnell-build/Dockerfile.build-tokenizers \
+  bonnell-build/
+```
 
-# pyarrow
-unzip -q bonnell-build/bonnell-wheels/pyarrow*.whl && \
-  find . -name "*.so" -exec sh -c 'objdump -d {} | grep -cE "vpcmpeq|vzeroupper|pinsrq"' \;
-# 期望: 全部 0
+导出 wheel：
+
+```bash
+ctr=$(docker create bonnell-build-tokenizers)
+mkdir -p bonnell-build/bonnell-wheels
+docker cp $ctr:/build/wheels/. bonnell-build/bonnell-wheels/
+docker rm $ctr
+```
+
+### 4. 构建 onnxruntime
+
+这是最慢的构建（~1-2h），但独立于其他三个。
+
+```bash
+docker build --network=host --no-cache \
+  -t bonnell-build-onnxruntime \
+  --build-arg ORT_VERSION=1.26.0 \
+  -f bonnell-build/Dockerfile.build-onnxruntime \
+  bonnell-build/
+```
+
+导出 wheel：
+
+```bash
+ctr=$(docker create bonnell-build-onnxruntime)
+mkdir -p bonnell-build/bonnell-wheels
+docker cp $ctr:/build/wheels/. bonnell-build/bonnell-wheels/
+docker rm $ctr
+```
+
+### 5. 验证 wheel 无 SSE4/AVX 指令
+
+```bash
+# numpy / pyarrow / onnxruntime — 期望 0 条 AVX 指令
+for whl in bonnell-build/bonnell-wheels/*.whl; do
+  echo "=== $(basename $whl) ==="
+  tmpdir=$(mktemp -d) && cd "$tmpdir"
+  unzip -q "$OLDPWD/$whl"
+  find . -name "*.so" -exec sh -c \
+    'count=$(objdump -d {} | grep -cE "vpcmpeq|vzeroupper|pinsrq"); echo "  {}: $count"' \;
+  cd "$OLDPWD" && rm -rf "$tmpdir"
+done
 
 # tokenizers — Rust 编译带 target-cpu=x86-64
-# 仍有 ~612 条 AVX 指令，但由 is_x86_feature_detected! 运行时保护
+# 仍有 ~600 条 AVX 指令，但由 is_x86_feature_detected!() 运行时保护，Bonnell 不会触发
 ```
 
-### 4. Dockerfile Bonnell 段
+### 6. 确认导出产物
 
-位于 `uv pip install -r requirements.txt` 之后，核心逻辑：
+```bash
+ls -lh bonnell-build/bonnell-wheels/
+# 期望看到: numpy-*.whl  pyarrow-*.whl  tokenizers-*.whl  onnxruntime-*.whl
 
-```dockerfile
-# 拷贝 Bonnell wheel
-COPY --chown=$UID:$GID ./bonnell-build/bonnell-wheels /tmp/bonnell-wheels
-
-# 拷贝 Arrow C++ 运行时库
-COPY --chown=$UID:$GID ./bonnell-build/arrow-libs /usr/local/lib
-
-# 替换 numpy / pyarrow / tokenizers
-RUN pip3 install --no-cache-dir --force-reinstall --no-deps \
-    /tmp/bonnell-wheels/numpy-2.4.6-cp311-cp311-linux_x86_64.whl \
-    /tmp/bonnell-wheels/pyarrow-18.1.0-cp311-cp311-linux_x86_64.whl \
-    /tmp/bonnell-wheels/tokenizers-0.22.2-cp39-abi3-linux_x86_64.whl && \
-    sed -i 's/__version__ = None/__version__ = "18.1.0"/' \
-    /usr/local/lib/python3.11/site-packages/pyarrow/__init__.py && \
-    rm -rf /tmp/bonnell-wheels && ldconfig
-
-# 安装 libarrow 运行时依赖
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libopenblas0 libre2-9 libthrift-0.17.0 libutf8proc2 && \
-    rm -rf /var/lib/apt/lists/*
-
-# 运行时 SIMD 环境变量
-ENV OPENBLAS_CORETYPE="BONNELL" \
-    ARROW_USER_SIMD_LEVEL="NONE" \
-    OPENCV_CPU_DISABLE="AVX2,AVX,SSE4.2,SSE4.1,SSSE3,SSE3"
+ls -lh bonnell-build/arrow-libs/libarrow*.so
+# 期望看到: libarrow.so, libparquet.so 等
 ```
 
-### 5. 构建最终镜像
+### 7. 构建最终镜像
 
 ```bash
 docker build --network=host -t open-webui:bonnell \
@@ -116,12 +141,15 @@ docker build --network=host -t open-webui:bonnell \
   -f Dockerfile .
 ```
 
-### 6. 验证
+> 注意：主 Dockerfile 的 Bonnell 段使用 glob 匹配 wheel 文件名
+> (`numpy-*.whl`, `pyarrow-*.whl` 等)，所以版本号变化不需要改 Dockerfile。
+
+### 8. 验证
 
 ```bash
 # 导入检查
 docker run --rm --entrypoint python3 open-webui:bonnell -c "
-import numpy,pyarrow,tokenizers,scipy,sklearn,cv2,ctranslate2,sentencepiece,pandas,faster_whisper
+import numpy,pyarrow,tokenizers,onnxruntime,scipy,sklearn,cv2,sentencepiece,pandas,faster_whisper
 print('All imports OK')
 "
 
@@ -137,12 +165,13 @@ docker stop test && docker rm test
 
 | 组件 | 需检查 | 说明 |
 |---|---|---|
-| Python 版本 | `Dockerfile.wheel-builder` 基础镜像必须与 `Dockerfile` base 一致 | 当前都是 `python:3.11-slim-bookworm` |
-| Arrow C++ | `Dockerfile.wheel-builder` 第 28 行 `--branch apache-arrow-X.X.X` | 与 requirements.txt 中 pyarrow 一致 |
-| numpy/pyarrow/tokenizers 版本 | `Dockerfile.wheel-builder` 中 `pip wheel` 命令 + `Dockerfile` 中 wheel 文件名 | 与 requirements.txt 一致 |
+| Python 版本 | 所有 `Dockerfile.build-*` 的 `BASE_IMAGE` arg 必须与主 Dockerfile base 一致 | 当前 `python:3.11.14-slim-bookworm` |
+| Arrow C++ | `Dockerfile.build-pyarrow` 的 `ARROW_VERSION` build arg | 必须与 requirements.txt 中 pyarrow 版本一致 |
+| onnxruntime | `Dockerfile.build-onnxruntime` 的 `ORT_VERSION` build arg | 必须与 requirements.txt 中 onnxruntime 版本一致 |
+| numpy / tokenizers | 不锁定版本，自动构建最新兼容版 | 主 Dockerfile 用 glob 匹配，无需修改 |
 | wheel 文件名中的 `cp311` | Python 大版本变了要更新 | 如 Python 3.12 → `cp312` |
 | 运行时库包名 | `libre2-9`、`libthrift-0.17.0` | Debian bookworm 的 `apt-cache search` 检查 |
-| pyarrow `__version__ = None` 修复 | sed 替换是否还有效 | 如果 Arrow 修了 shallow clone 版本问题可以去除此行 |
+| pyarrow `__version__ = None` 修复 | 自动从 wheel 文件名提取版本并 sed | 如果 Arrow 修了 shallow clone 版本问题可去除此段 |
 
 ## 运行时 SIMD 控制总结
 
@@ -151,4 +180,15 @@ docker stop test && docker rm test
 | `OPENBLAS_CORETYPE` | OpenBLAS（scipy/numpy 的 BLAS） | `BONNELL` |
 | `ARROW_USER_SIMD_LEVEL` | Arrow C++ CPU dispatch | `NONE` |
 | `OPENCV_CPU_DISABLE` | OpenCV 多架构 dispatch | `AVX2,AVX,SSE4.2,SSE4.1,SSSE3,SSE3` |
+| `NPY_DISABLE_CPU_FEATURES` | numpy CPU feature 检测 | `AVX,AVX2,AVX512F,FMA3,FMA4,SSE4_1,SSE4_2,POPCNT` |
 | Rust `is_x86_feature_detected!` | tokenizers, chromadb, hf_xet 等 | 运行时自动检测，Bonnell 回退 scalar |
+
+## 已移除的无引用依赖
+
+以下依赖在上游 `requirements.txt` 中存在，但代码中零 import，已从我们的版本中移除：
+
+| 依赖 | 说明 |
+|---|---|
+| `APScheduler` | 代码无任何 import |
+| `RestrictedPython` | 代码无任何 import |
+| `rapidocr-onnxruntime` | 代码无任何 import，onnxruntime 保留（chromadb 硬依赖） |

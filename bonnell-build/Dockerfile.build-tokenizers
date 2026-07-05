@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1
+# ── Bonnell (x86-64-v1) wheel builder: tokenizers ───────
+# Builds tokenizers from source with Rust target-cpu=x86-64
+# so no SSE4.x / AVX instructions are emitted unconditionally.
+#
+# Note: tokenizers uses Rust's is_x86_feature_detected!() for
+# runtime SIMD dispatch — AVX2 paths exist but are guarded.
+#
+# IMPORTANT: The build host likely has full SIMD (SSE4/AVX).
+# We must explicitly set target-cpu=x86-64 so Rust does not
+# auto-detect host features and emit SSE4/AVX instructions.
+# ─────────────────────────────────────────────────────────
+ARG BASE_IMAGE=python:3.11.14-slim-bookworm
+FROM ${BASE_IMAGE}
+
+WORKDIR /build
+
+# ── System build deps ───────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    g++ make pkg-config unzip binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Rust toolchain (for tokenizers) ─────────────────────
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# ── Python build deps ───────────────────────────────────
+# puccinialin is required by tokenizers >= 0.23 as a build dep
+RUN pip3 install --no-cache-dir setuptools wheel maturin patchelf puccinialin
+
+# ── Force x86-64 baseline for any C/C++ code ───────────
+ENV CFLAGS="-march=x86-64 -mtune=generic -O2 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2" \
+    CXXFLAGS="-march=x86-64 -mtune=generic -O2 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2" \
+    LDFLAGS="-march=x86-64"
+
+# ── Build tokenizers from source ────────────────────────
+# No version pin — builds the latest tokenizers compatible
+# with Python 3.11.  The cp39-abi3 tag means it's compatible
+# with any Python >= 3.9.
+#
+# CARGO_BUILD_RUSTFLAGS is the key flag — it forces Rust to
+# emit only x86-64 baseline instructions regardless of host CPU.
+# Do NOT use RUSTFLAGS (without CARGO_BUILD_ prefix) as maturin
+# may not pick it up.
+RUN CARGO_BUILD_RUSTFLAGS="-C target-cpu=x86-64" \
+    pip3 wheel --no-build-isolation --no-cache-dir --no-binary tokenizers \
+    -w /build/wheels/ \
+    tokenizers==0.22.2
+
+# ── Verify ──────────────────────────────────────────────
+# tokenizers still has ~600 AVX instructions but they are
+# guarded by is_x86_feature_detected!() at runtime.
+RUN echo "=== Built tokenizers wheel ===" && \
+    ls -lh /build/wheels/tokenizers-*.whl
+
+CMD ["sh", "-c", "echo 'Built wheels:'; ls -lh /build/wheels/"]

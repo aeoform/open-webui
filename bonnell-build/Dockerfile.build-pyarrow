@@ -1,0 +1,118 @@
+# syntax=docker/dockerfile:1
+# ── Bonnell (x86-64-v1) wheel builder: pyarrow ──────────
+# Builds Arrow C++ and pyarrow from source with SIMD_LEVEL=NONE
+# so no SSE4.x / AVX instructions are emitted.
+#
+# Arrow C++ and pyarrow are compiled in a single RUN step
+# because pyarrow's build requires the Arrow source tree.
+#
+# IMPORTANT: The build host likely has full SIMD (SSE4/AVX).
+# We must explicitly restrict the compiler to x86-64 baseline
+# so the resulting wheel runs on Bonnell (Atom D525).
+# ─────────────────────────────────────────────────────────
+ARG BASE_IMAGE=python:3.11.14-slim-bookworm
+FROM ${BASE_IMAGE}
+
+WORKDIR /build
+
+# ── System build deps ───────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git cmake ninja-build pkg-config g++ make unzip zip binutils \
+    libopenblas-dev libatlas-base-dev gfortran \
+    libssl-dev libcurl4-openssl-dev liblz4-dev libzstd-dev \
+    libbrotli-dev libsnappy-dev libboost-dev \
+    libre2-dev libthrift-dev libutf8proc-dev \
+    libgflags-dev libgoogle-glog-dev libprotobuf-dev protobuf-compiler \
+    rapidjson-dev libdouble-conversion-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python build deps ───────────────────────────────────
+RUN pip3 install --no-cache-dir setuptools wheel meson-python Cython \
+    pybind11 numpy patchelf
+
+# ── Force x86-64 baseline everywhere ────────────────────
+# ENV ensures any subprocess (cmake, pyarrow setup, etc.) sees these.
+ENV CFLAGS="-march=x86-64 -mtune=generic -O2 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2" \
+    CXXFLAGS="-march=x86-64 -mtune=generic -O2 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2" \
+    LDFLAGS="-march=x86-64"
+
+# ── Version arg (change when upgrading) ─────────────────
+ARG ARROW_VERSION=20.0.0
+
+# ── Build Arrow C++ + pyarrow (must be one RUN) ────────
+# pyarrow needs the Arrow source tree at build time.
+# After building, we stage only the runtime .so files
+# into /build/arrow-libs/ for the main Dockerfile to COPY.
+RUN set -e; \
+    git clone --depth 1 --branch "apache-arrow-${ARROW_VERSION}" \
+      https://github.com/apache/arrow.git /tmp/arrow-src; \
+    \
+    # ── Arrow C++ ────────────────────────────────────── \
+    mkdir -p /tmp/arrow-src/cpp/build && cd /tmp/arrow-src/cpp/build; \
+    cmake .. -GNinja \
+      -DCMAKE_C_FLAGS="${CFLAGS}" \
+      -DCMAKE_CXX_FLAGS="${CXXFLAGS}" \
+      -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
+      -DARROW_SIMD_LEVEL=NONE \
+      -DARROW_RUNTIME_SIMD_LEVEL=NONE \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DARROW_DEPENDENCY_SOURCE=AUTO \
+      -DARROW_PARQUET=ON \
+      -DARROW_DATASET=ON \
+      -DARROW_CSV=ON \
+      -DARROW_JSON=ON \
+      -DARROW_JEMALLOC=OFF \
+      -DARROW_BUILD_TESTS=OFF \
+      -DARROW_BUILD_BENCHMARKS=OFF \
+      -DARROW_BUILD_UTILITIES=OFF \
+      -DARROW_FLIGHT=OFF \
+      -DARROW_GANDIVA=OFF \
+      -DARROW_ORC=OFF \
+      -DARROW_HDFS=OFF \
+      -DARROW_WITH_UCX=OFF \
+      -DCMAKE_INSTALL_PREFIX=/usr/local; \
+    ninja -j"$(nproc)" && ninja install && ldconfig; \
+    echo "=== Arrow C++ done ==="; \
+    \
+    # ── pyarrow ──────────────────────────────────────── \
+    cd /tmp/arrow-src/python; \
+    ARROW_HOME=/usr/local PYARROW_WITH_SYSTEM_ARROW=1 \
+    CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)" \
+    PYARROW_CMAKE_OPTIONS="-DARROW_SIMD_LEVEL=NONE -DCMAKE_SYSTEM_PROCESSOR=x86_64" \
+    pip3 wheel --no-build-isolation --no-cache-dir \
+      -w /build/wheels/ .; \
+    echo "=== pyarrow wheel built ==="; \
+    \
+    # ── Fix version (shallow clone → __version__ = None) \
+    WHL=$(ls /build/wheels/pyarrow-0.0.0*.whl 2>/dev/null || ls /build/wheels/pyarrow-*.whl | head -1); \
+    if echo "$WHL" | grep -q '0.0.0'; then \
+      WHL_NAME=$(basename "$WHL"); \
+      DST_NAME=$(echo "$WHL_NAME" | sed 's/0\.0\.0/'"${ARROW_VERSION}"'/'); \
+      mkdir -p /tmp/patch-pa && cd /tmp/patch-pa; \
+      unzip -q "$WHL"; \
+      sed -i "s/__version__ = None/__version__ = \"${ARROW_VERSION}\"/" pyarrow/__init__.py; \
+      zip -q -r "/build/wheels/$DST_NAME" .; \
+      rm "$WHL"; \
+      cd /build/wheels && rm -rf /tmp/patch-pa; \
+      echo "=== Version patched: $WHL_NAME → $DST_NAME ==="; \
+    fi; \
+    ls -la /build/wheels/pyarrow-*; \
+    \
+    # ── Stage Arrow C++ runtime libs ────────────────── \
+    mkdir -p /build/arrow-libs; \
+    cp -a /usr/local/lib/libarrow*.so* /build/arrow-libs/; \
+    cp -a /usr/local/lib/libparquet*.so* /build/arrow-libs/; \
+    echo "=== Arrow runtime libs staged ==="; \
+    \
+    rm -rf /tmp/arrow-src
+
+# ── Verify no SSE4/AVX ─────────────────────────────────
+RUN echo "=== Checking pyarrow wheel for SSE4/AVX ===" && \
+    WHL=$(ls /build/wheels/pyarrow-*.whl | head -1) && \
+    mkdir -p /tmp/check-pa && cd /tmp/check-pa && \
+    unzip -q "$WHL" && \
+    find . -name "*.so" -exec sh -c \
+      'count=$(objdump -d {} | grep -cE "vpcmpeq|vzeroupper|pinsrq"); echo "{}: $count"' \; && \
+    rm -rf /tmp/check-pa
+
+CMD ["sh", "-c", "echo 'Built wheels:'; ls -lh /build/wheels/; echo 'Arrow libs:'; ls -lh /build/arrow-libs/"]

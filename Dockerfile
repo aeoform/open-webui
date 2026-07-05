@@ -126,7 +126,7 @@ RUN chown -R $UID:$GID /app $HOME
 # Install common system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    git build-essential pandoc gcc netcat-openbsd curl jq \
+    git build-essential pandoc gcc netcat-openbsd curl jq ca-certificates \
     libmariadb-dev \
     python3-dev \
     ffmpeg libsm6 libxext6 zstd \
@@ -134,6 +134,9 @@ RUN apt-get update && \
 
 # install python dependencies
 COPY --chown=$UID:$GID ./backend/requirements.txt ./requirements.txt
+
+# Set UV_LINK_MODE to copy to prevent 0-byte file corruption in QEMU arm64 cross-builds
+ENV UV_LINK_MODE=copy
 
 RUN set -e; \
     pip3 install --no-cache-dir uv; \
@@ -166,21 +169,32 @@ RUN set -e; \
 # ───────────────────────────────────────────────────────────
 # Pre-built wheels in bonnell-build/bonnell-wheels/ replace
 # the manylinux ones for numpy, pyarrow, and tokenizers.
-# Pre-built .so libs in bonnell-build/arrow-libs/ provide the
-# Bonnell-safe libarrow runtime.
+# Pre-built .so libs in bonnell-build/arrow-libs/
+# provide the Bonnell-safe libarrow runtime.
 # Other SIMD-heavy packages (scipy, opencv, torch, etc.)
 # are controlled at runtime via env vars below.
+# onnxruntime uses runtime SIMD dispatch (MLAS) and works
+# with the official manylinux wheel on Bonnell.
+# Wheel filenames use globs so version bumps don't require
+# editing this file — just rebuild the wheels.
 # ───────────────────────────────────────────────────────────
 COPY --chown=$UID:$GID ./bonnell-build/bonnell-wheels /tmp/bonnell-wheels
 COPY --chown=$UID:$GID ./bonnell-build/arrow-libs /usr/local/lib
 
-RUN pip3 install --no-cache-dir --force-reinstall --no-deps \
-    /tmp/bonnell-wheels/numpy-2.4.6-cp311-cp311-linux_x86_64.whl \
-    /tmp/bonnell-wheels/pyarrow-18.1.0-cp311-cp311-linux_x86_64.whl \
-    /tmp/bonnell-wheels/tokenizers-0.22.2-cp39-abi3-linux_x86_64.whl && \
-    sed -i 's/__version__ = None/__version__ = "18.1.0"/' \
-    /usr/local/lib/python3.11/site-packages/pyarrow/__init__.py && \
-    rm -rf /tmp/bonnell-wheels && \
+RUN set -e; \
+    # Extract pyarrow version from wheel filename for post-install fix \
+    PYARROW_VER=$(ls /tmp/bonnell-wheels/pyarrow-*.whl | head -1 \
+      | sed 's/.*pyarrow-\([0-9][0-9.]*\).*/\1/'); \
+    pip3 install --no-cache-dir --force-reinstall --no-deps \
+      /tmp/bonnell-wheels/numpy-*.whl \
+      /tmp/bonnell-wheels/pyarrow-*.whl \
+      /tmp/bonnell-wheels/tokenizers-*.whl; \
+    # Fix pyarrow version when built from shallow clone \
+    PYARROW_INIT="/usr/local/lib/python3.11/site-packages/pyarrow/__init__.py"; \
+    if grep -q '__version__ = None' "$PYARROW_INIT" 2>/dev/null; then \
+      sed -i "s/__version__ = None/__version__ = \"${PYARROW_VER}\"/" "$PYARROW_INIT"; \
+    fi; \
+    rm -rf /tmp/bonnell-wheels; \
     ldconfig
 
 # Runtime SIMD controls for pre-built packages
