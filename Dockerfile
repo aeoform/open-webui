@@ -28,7 +28,9 @@ FROM --platform=$BUILDPLATFORM node:22-alpine3.20 AS build
 ARG BUILD_HASH
 
 # Set Node.js options (heap limit Allocation failed - JavaScript heap out of memory)
-# ENV NODE_OPTIONS="--max-old-space-size=4096"
+# 0.11.3 frontend needs more than the default V8 old-space; upstream keeps this
+# line commented out, but this fork's build host OOMs during `vite build`.
+ENV NODE_OPTIONS="--max-old-space-size=8192"
 
 WORKDIR /app
 
