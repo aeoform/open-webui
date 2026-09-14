@@ -161,6 +161,65 @@ docker run -d --name test -p 8080:8080 open-webui:bonnell
 docker stop test && docker rm test
 ```
 
+## v0.11.3 升级记录（2026-09-14）
+
+### 1. 前端构建必须放开 Node 堆上限
+
+0.11.3 前端体积变大，`npm run build` 会在默认 V8 old-space 下 OOM：
+
+```
+#23 FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed
+     - JavaScript heap out of memory
+```
+
+主 Dockerfile 里已把上游注释掉的那行启用（比上游的 4096 更宽）：
+
+```dockerfile
+ENV NODE_OPTIONS="--max-old-space-size=8192"
+```
+
+### 2. 依赖变化
+
+| 项 | 变化 | 说明 |
+|---|---|---|
+| numpy / pyarrow / onnxruntime / tokenizers | **无变化** | 与 v0.11.0 完全一致，`bonnell-wheels/` 里的 wheel 直接复用，无需重编 |
+| aiodns | 4.0.4 → 3.6.1 | 上游回退（4.x 的 pycares 5 在某些主机上解析 DNS 有问题），对 SIMD 无影响 |
+| python-docx | 新增 | 纯 Python |
+| 见下方「已移除的无引用依赖」 | 删除 8 个 | 全部为零引用且无人依赖的包 |
+
+> 结论：本次镜像的**原生二进制集合与 v0.11.0 的 Bonnell 镜像相同**，x86-64-v1 兼容风险没有变化。
+
+### 3. v1 兼容性怎么验证
+
+静态扫描（`objdump` 反汇编镜像内所有 .so，统计 Bonnell 不支持的指令）：
+
+```bash
+docker run --rm -v ./bonnell-build/isa-scan.sh:/scan.sh:ro open-webui:bonnell bash /scan.sh
+```
+
+实测结果：numpy / pyarrow = **0 条**；tokenizers 有 223 条 AVX 但由 Rust
+`is_x86_feature_detected!()` 运行时保护；其余含 v2 指令的库（torch / scipy /
+blis / ctranslate2 / av 等）均带 CPUID 运行时分发；rapidfuzz 的 `*_avx2.so`
+是独立模块，v1 机器根本不会加载它。
+
+**最终判定必须在目标机器上做**（静态反汇编无法区分「运行时分发」和「无条件执行」）：
+
+```bash
+bash bonnell-build/smoke-test-v1.sh open-webui:bonnell
+```
+
+脚本会逐模块开独立子进程导入（SIGILL 无法 try/except 捕获，必须分开进程）、
+再真实执行 numpy/torch matmul、pyarrow 读写、tiktoken、onnxruntime 等 SIMD 内核，
+最后启动容器查 `/api/version`。
+
+### 4. 未做的精简（有功能影响，需先改配置）
+
+本地推理栈（torch / transformers / sentence-transformers / faster-whisper，约 1.5–2 GB）
+**故意保留**：默认 `RAG_EMBEDDING_ENGINE=''`、`AUDIO_STT_ENGINE=''` 就是走本地，
+删掉后上传文档 / 语音转写会直接报错。若要精简，需先确认 embedding / rerank / STT
+全部走远程（Ollama 或 OpenAI 兼容 API），再加 `--build-arg USE_SLIM=true` 并移除
+Dockerfile 里的 torch 安装行。
+
 ## 版本升级注意事项
 
 | 组件 | 需检查 | 说明 |
@@ -192,3 +251,29 @@ docker stop test && docker rm test
 | `APScheduler` | 代码无任何 import |
 | `RestrictedPython` | 代码无任何 import |
 | `rapidocr-onnxruntime` | 代码无任何 import，onnxruntime 保留（chromadb 硬依赖） |
+
+### v0.11.3 又移除 8 个（AST 扫 259 个 .py + pip 全图重解析双重验证）
+
+| 依赖 | 依据 |
+|---|---|
+| `pytube` | YouTube 转写走 youtube-transcript-api，pytube 零引用 |
+| `pypandoc` | 零引用（pandoc 二进制由 unstructured 使用，apt 包保留） |
+| `pymdown-extensions` | `utils/pdf_generator.py` 里只剩注释掉的引用 |
+| `opencv-python-headless` | rapidocr 移除后的遗留，零引用 |
+| `pymongo` | 已无 MongoDB 向量库后端（`retrieval/vector/dbs/` 里没有） |
+| `google-api-python-client` / `google-auth-oauthlib` / `google-auth-httplib2` | Drive 集成只剩前端 Picker，后端只传 client_id/api_key，Python SDK 零引用 |
+
+**看着没用但必须留的**（靠字符串 / 动态加载，删了运行时报错）：
+
+| 依赖 | 谁在用 |
+|---|---|
+| `rank-bm25` | langchain `BM25Retriever`（混合检索） |
+| `openpyxl` / `xlrd` / `pyxlsb` | pandas `pd.ExcelFile` 的 Excel 引擎（ExcelLoader 回退路径） |
+| `aiosqlite` | SQLAlchemy 默认 SQLite 方言名（删了**整个程序起不来**） |
+| `pypdf` / `docx2txt` / `unstructured` / `nltk` / `python-docx` / `msoffcrypto-tool` | langchain loader 与 unstructured 的 docx/pdf/xlsx 解析路径 |
+| `fpdf2` | `utils/pdf_generator.py` 的 `from fpdf import FPDF`（注意：模块名是 `fpdf` 不是 `fpdf2`） |
+| `psycopg2-binary` | `retrieval/vector/dbs/opengauss.py` 的 `PGDialect_psycopg2` |
+| `onnxruntime` | chromadb 硬依赖 |
+| `openai` / `anthropic` / `langchain` | 用户自建 Functions / Tools 会 import |
+| `aiodns` | 上游刻意 pin 的 aiohttp DNS-on-event-loop 方案 |
+| `PyMySQL` | 可选 MySQL/MariaDB 主库驱动（`DATABASE_URL=mysql+pymysql://`） |
