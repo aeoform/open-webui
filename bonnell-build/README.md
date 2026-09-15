@@ -189,28 +189,56 @@ ENV NODE_OPTIONS="--max-old-space-size=8192"
 
 > 结论：本次镜像的**原生二进制集合与 v0.11.0 的 Bonnell 镜像相同**，x86-64-v1 兼容风险没有变化。
 
-### 3. v1 兼容性怎么验证
+### 3. v1 兼容性（已在 Atom D525 实机验证通过）
 
-静态扫描（`objdump` 反汇编镜像内所有 .so，统计 Bonnell 不支持的指令）：
+本镜像已在 x86-64-v1 实机跑通。以下是当时用到的判定方法，以后升级要复查时照做：
+
+**静态扫描**（`objdump` 反汇编镜像内所有 .so，统计 Bonnell 不支持的指令）：
 
 ```bash
-docker run --rm -v ./bonnell-build/isa-scan.sh:/scan.sh:ro open-webui:bonnell bash /scan.sh
+docker run --rm --entrypoint bash open-webui:bonnell -c '
+  apt-get update -qq && apt-get install -y -qq binutils >/dev/null 2>&1
+  SP=/usr/local/lib/python3.11/site-packages
+  find $SP -name "*.so*" -size +16k | while read f; do
+    n=$(objdump -d "$f" | grep -cE "\bv[a-z][a-z0-9]*[[:space:]]|\b(popcnt|ptest|pcmpistri|crc32|crc32|pmulld|roundps|pinsrq|pextrq|andn|tzcnt|lzcnt|bzhi|mulx|pdep|rorx|sarx|shlx|movbe|aesenc|pclmulqdq)\b")
+    [ "$n" != 0 ] && printf "%8s  %s\n" "$n" "${f#$SP/}"
+  done | sort -rn | head -30'
 ```
 
-实测结果：numpy / pyarrow = **0 条**；tokenizers 有 223 条 AVX 但由 Rust
+实测结果：numpy / pyarrow = **0 条**（自己重编的）；tokenizers 有 AVX 但由 Rust
 `is_x86_feature_detected!()` 运行时保护；其余含 v2 指令的库（torch / scipy /
-blis / ctranslate2 / av 等）均带 CPUID 运行时分发；rapidfuzz 的 `*_avx2.so`
-是独立模块，v1 机器根本不会加载它。
+blis / ctranslate2 / av / onnxruntime 等）均带 CPUID 运行时分发；rapidfuzz 的
+`*_avx2.so` 是独立模块，v1 机器根本不会加载它。
 
-**最终判定必须在目标机器上做**（静态反汇编无法区分「运行时分发」和「无条件执行」）：
+**实机逐模块导入**：SIGILL 会直接杀掉进程、无法 try/except 捕获，所以必须**每个模块开一个独立进程**，靠退出码定位：
 
 ```bash
-bash bonnell-build/smoke-test-v1.sh open-webui:bonnell
+for m in numpy pyarrow tokenizers onnxruntime scipy sklearn pandas chromadb \
+         torch transformers faster_whisper chromadb sentence_transformers; do
+  docker run --rm --entrypoint python3 open-webui:bonnell -c "import $m" >/dev/null 2>&1
+  echo "rc=$? $m"   # rc=132 即 SIGILL：该库含本机不支持的指令
+  docker run --rm --entrypoint python3 open-webui:bonnell -c "import $m" 2>&1 | tail -1
+done
 ```
 
-脚本会逐模块开独立子进程导入（SIGILL 无法 try/except 捕获，必须分开进程）、
-再真实执行 numpy/torch matmul、pyarrow 读写、tiktoken、onnxruntime 等 SIMD 内核，
-最后启动容器查 `/api/version`。
+注意：只 import 走不到 SIMD 内核，最好再真算一遍：
+
+```bash
+docker run --rm --entrypoint python3 open-webui:bonnell -c "
+import numpy as np, torch, pyarrow as pa, pyarrow.parquet as pq, tempfile, os, tiktoken
+print(float((np.random.rand(512,512).astype('float32') @ np.random.rand(512,512).astype('float32')).sum()))
+print(float((torch.ones(256,256) @ torch.ones(256,256)).sum()))
+f=os.path.join(tempfile.mkdtemp(),'t.parquet'); pq.write_table(pa.table({'x':list(range(1000))}), f)
+print(pq.read_table(f).num_rows, len(tiktoken.get_encoding('cl100k_base').encode('hello 世界')))"
+```
+
+最后起容器确认 `/health` 与 `/api/version`：
+
+```bash
+docker run -d --name owui -p 8080:8080 open-webui:bonnell
+docker inspect -f '{{.State.Health.Status}}' owui   # 首次启动要下/校验 embedding 模型，可能 2-3 分钟
+curl -s localhost:8080/api/version
+```
 
 ### 4. 未做的精简（有功能影响，需先改配置）
 
