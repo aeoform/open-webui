@@ -197,6 +197,46 @@ curl -s localhost:8080/api/version; curl -s localhost:8080/api/config | head -c 
 docker stop test && docker rm test
 ```
 
+## 导出镜像（交付目标机）
+
+Docker（containerd 镜像仓库）默认把镜像层存成 gzip，所以 `docker save` 出来的 tar
+虽然**外层**不是压缩包，**里面的层是 gzip 的**（约 228 MB）。要连层也不压缩：
+
+```bash
+# A. 不压缩层：buildx 直接输出 classic docker-archive（约 711 MB，单 tag）
+docker buildx build --network=host \
+  --build-arg USE_SLIM=true --build-arg USE_CUDA=false --build-arg USE_OLLAMA=false \
+  -f Dockerfile \
+  --output type=docker,dest=open-webui-bonnell.tar,name=open-webui:bonnell-slim,compression=uncompressed,force-compression=true .
+
+# B. docker save 原样：OCI 布局、层为 gzip（约 228 MB，两个 tag）
+docker save -o open-webui-bonnell-oci.tar open-webui:bonnell open-webui:bonnell-slim
+```
+
+> `--output` 的 `name=` 只接受一个名字（逗号会被当成下一个 option），所以想要两个 tag
+> 就只能用 B，或者加载后 `docker tag` 一下。
+
+**本次（v0.11.4 slim）实际交付的产物**（放在 `/opt/open-webui-image/`，配 `SHA256SUMS.txt`）：
+
+| 文件 | 大小 | 格式 |
+|---|---|---|
+| `open-webui-bonnell-0.11.4-slim-raw.tar` | 711 MB | classic docker-archive，**层未压缩**，tag = `open-webui:bonnell` + `open-webui:bonnell-slim` |
+| `open-webui-bonnell-0.11.4-slim.tar` | 228 MB | OCI 布局，层为 gzip，同样两个 tag（备用，传输快） |
+
+711 MB 那份的做法（已验证可 `docker load`）：先 `docker save` 出 OCI 归档 → 逐层 gunzip
+→ 按 classic 布局重打包（`<diffid>/layer.tar` + `VERSION` + `manifest.json` +
+`repositories`，每层 sha256 必须等于 config 里的 `rootfs.diff_ids`）→ 回灌验证。
+
+> 老版本 docker 只认 classic docker-archive（OCI 布局要 25+），所以优先交付不压缩那份。
+
+目标机（软路由/NAS）加载：
+
+```bash
+scp open-webui-bonnell-0.11.4-slim-raw.tar <target>:/tmp/
+ssh <target> 'docker load -i /tmp/open-webui-bonnell-0.11.4-slim-raw.tar && docker images | grep open-webui'
+# 传输校验：scp 两边跑 sha256sum 对比
+```
+
 ## v0.11.3 升级记录（2026-09-14）
 
 ### 1. 前端构建必须放开 Node 堆上限
