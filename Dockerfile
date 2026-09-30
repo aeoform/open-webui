@@ -197,31 +197,47 @@ RUN --mount=from=ghcr.io/astral-sh/uv:0.12.10,source=/uv,target=/bin/uv \
 # with the official manylinux wheel on Bonnell.
 # Wheel filenames use globs so version bumps don't require
 # editing this file — just rebuild the wheels.
+#
+# USE_SLIM=true (external AI services + pgvector) only needs
+# the numpy wheel: requirements-slim.txt has no pyarrow,
+# tokenizers, torch, onnxruntime or opencv.
 # ───────────────────────────────────────────────────────────
 COPY --chown=$UID:$GID ./bonnell-build/bonnell-wheels /tmp/bonnell-wheels
-COPY --chown=$UID:$GID ./bonnell-build/arrow-libs /usr/local/lib
+COPY --chown=$UID:$GID ./bonnell-build/arrow-libs /tmp/bonnell-arrow-libs
 
 RUN set -e; \
-    # Extract pyarrow version from wheel filename for post-install fix \
+    if [ "$USE_SLIM" = "true" ]; then \
+    pip3 install --no-cache-dir --force-reinstall --no-deps \
+      /tmp/bonnell-wheels/numpy-*.whl; \
+    else \
     PYARROW_VER=$(ls /tmp/bonnell-wheels/pyarrow-*.whl | head -1 \
       | sed 's/.*pyarrow-\([0-9][0-9.]*\).*/\1/'); \
     pip3 install --no-cache-dir --force-reinstall --no-deps \
       /tmp/bonnell-wheels/numpy-*.whl \
       /tmp/bonnell-wheels/pyarrow-*.whl \
       /tmp/bonnell-wheels/tokenizers-*.whl; \
-    # Fix pyarrow version when built from shallow clone \
     PYARROW_INIT="/usr/local/lib/python3.11/site-packages/pyarrow/__init__.py"; \
     if grep -q '__version__ = None' "$PYARROW_INIT" 2>/dev/null; then \
       sed -i "s/__version__ = None/__version__ = \"${PYARROW_VER}\"/" "$PYARROW_INIT"; \
     fi; \
-    rm -rf /tmp/bonnell-wheels; \
+    cp -a /tmp/bonnell-arrow-libs/. /usr/local/lib/; \
+    fi; \
+    rm -rf /tmp/bonnell-wheels /tmp/bonnell-arrow-libs; \
     ldconfig
 
-# Runtime SIMD controls for pre-built packages
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libopenblas0 libre2-9 libthrift-0.17.0 libutf8proc2 && \
+# Runtime libraries for the rebuilt wheels.
+# libopenblas0 backs numpy/scipy BLAS (OPENBLAS_CORETYPE picks the Bonnell kernel);
+# libthrift/libutf8proc are only needed by libarrow, i.e. by non-slim images.
+# libre2-9 is kept in both variants (google-re2 / libarrow).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libopenblas0 libre2-9 && \
+    if [ "$USE_SLIM" != "true" ]; then \
+    apt-get install -y --no-install-recommends libthrift-0.17.0 libutf8proc2; \
+    fi && \
     rm -rf /var/lib/apt/lists/*
 
+# Runtime SIMD controls for pre-built packages. The OPENCV/ARROW ones are no-ops
+# in a slim image (neither opencv nor libarrow is present there).
 ENV NPY_DISABLE_CPU_FEATURES="AVX,AVX2,AVX512F,FMA3,FMA4,SSE4_1,SSE4_2,POPCNT" \
     OPENBLAS_CORETYPE="BONNELL" \
     ARROW_USER_SIMD_LEVEL="NONE" \

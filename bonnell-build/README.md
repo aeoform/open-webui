@@ -7,9 +7,14 @@ Open WebUI 的 manylinux 预编译包默认要求 x86-64-v2（SSE4.2），在 Bo
 
 ## 整体策略
 
+- **镜像形态**：当前用 **slim**（`USE_SLIM=true`）——本地 AI 栈与本地文档解析整条链路
+  全部交给远程服务，镜像里只剩 `numpy` 一个需要 Bonnell 重编的包。
+  完整镜像的四个重编包仍列在下面，保留做法备查。
 - **4 个包源码重建**：numpy、pyarrow、tokenizers、onnxruntime — 这些无法用运行时环境变量完全控制 SIMD
+  （slim 下只有 numpy 会进镜像；pyarrow / tokenizers / onnxruntime 都不装）
 - **其余包用 manylinux wheel**：scipy、sklearn、opencv、ctranslate2 等通过运行时环境变量控制 SIMD dispatch
 - **Arrow C++ .so 直接拷贝**：pyarrow 依赖的 libarrow 库从 builder 镜像复制到最终镜像
+  （仅完整镜像；slim 不装 pyarrow，也不再拷 `arrow-libs/`）
 - **每个依赖独立编译容器**：互不影响，某一个失败不需要重头再来
 
 ## 文件结构
@@ -135,29 +140,60 @@ ls -lh bonnell-build/arrow-libs/libarrow*.so
 
 ### 7. 构建最终镜像
 
+**当前部署形态：slim**（v0.11.4 起切换，详见下文「v0.11.4 升级记录」）：
+
 ```bash
-docker build --network=host -t open-webui:bonnell \
+# 实际使用：slim（外部 AI 服务 + pgvector）
+docker build --network=host \
+  -t open-webui:bonnell -t open-webui:bonnell-slim \
+  --build-arg USE_SLIM=true --build-arg USE_CUDA=false --build-arg USE_OLLAMA=false \
+  -f Dockerfile .
+```
+
+完整镜像（带本地 torch / chroma / 文档解析，已不再使用，仅保留命令备查）：
+
+```bash
+docker build --network=host -t open-webui:bonnell-full \
   --build-arg USE_CUDA=false --build-arg USE_OLLAMA=false \
   -f Dockerfile .
 ```
 
 > 注意：主 Dockerfile 的 Bonnell 段使用 glob 匹配 wheel 文件名
 > (`numpy-*.whl`, `pyarrow-*.whl` 等)，所以版本号变化不需要改 Dockerfile。
+> slim 下只装 `numpy-*.whl`，不再复制 `arrow-libs/`。
 
 ### 8. 验证
 
+完整镜像的导入检查（slim 下 torch / pyarrow / tokenizers / onnxruntime / opencv
+都不在，请按下面 slim 版做）：
+
 ```bash
-# 导入检查
+# 导入检查（完整镜像）
 docker run --rm --entrypoint python3 open-webui:bonnell -c "
 import numpy,pyarrow,tokenizers,onnxruntime,scipy,sklearn,cv2,sentencepiece,pandas,faster_whisper
 print('All imports OK')
 "
+```
 
-# 启动测试
+**slim 镜像的验证**（当前形态）：
+
+```bash
+# 1) 包清单：应该找不到 torch/pyarrow/tokenizers/onnxruntime/opencv/chromadb/playwright
+#    而 numpy 必须是自编的那一份
+docker run --rm --entrypoint bash open-webui:bonnell -c '
+  python3 -c "import numpy; print(numpy.__version__, numpy.__file__)"
+  pip3 list 2>/dev/null | grep -iE "torch|pyarrow|tokenizers|onnxruntime|opencv|chromadb|playwright|rapidocr" || echo "none of the heavy stack present (expected)"
+  ldd /usr/local/lib/python3.11/site-packages/numpy/_core/_multiarray_umath*.so | grep openblas'
+
+# 2) 真算一遍（走 OpenBLAS；若含本机不支持的指令会直接 rc=132 / SIGILL）
+docker run --rm --entrypoint python3 open-webui:bonnell -c "
+import numpy as np
+print(float((np.random.rand(512,512).astype('float32') @ np.random.rand(512,512).astype('float32')).sum()))"
+
+# 3) 起容器（未配外部 embedding/pgvector 时 /health 能过，但 RAG 功能会 503）
 docker run -d --name test -p 8080:8080 open-webui:bonnell
-# 等 2-3 分钟后 docker ps 应显示 (healthy)
-
-# 清理
+docker inspect -f '{{.State.Health.Status}}' test   # 等 2-3 分钟
+curl -s localhost:8080/api/version; curl -s localhost:8080/api/config | head -c 300
 docker stop test && docker rm test
 ```
 
@@ -240,13 +276,14 @@ docker inspect -f '{{.State.Health.Status}}' owui   # 首次启动要下/校验 
 curl -s localhost:8080/api/version
 ```
 
-### 4. 未做的精简（有功能影响，需先改配置）
+### 4. 未做的精简（已在 v0.11.4 改为 slim）
 
-本地推理栈（torch / transformers / sentence-transformers / faster-whisper，约 1.5–2 GB）
-**故意保留**：默认 `RAG_EMBEDDING_ENGINE=''`、`AUDIO_STT_ENGINE=''` 就是走本地，
-删掉后上传文档 / 语音转写会直接报错。若要精简，需先确认 embedding / rerank / STT
-全部走远程（Ollama 或 OpenAI 兼容 API），再加 `--build-arg USE_SLIM=true` 并移除
-Dockerfile 里的 torch 安装行。
+v0.11.3 当时**故意保留**了本地推理栈（torch / transformers / sentence-transformers /
+faster-whisper，约 1.5–2 GB），因为默认 `RAG_EMBEDDING_ENGINE=''`、
+`AUDIO_STT_ENGINE=''` 就是走本地，删掉后上传文档 / 语音转写会直接报错。
+
+v0.11.4 已改为 **slim 形态**（`--build-arg USE_SLIM=true`），代价是上面第 2 节列的那些
+远程替代必须真的配好；否则相关功能会直接 503（不是静默降级）。
 
 ## v0.11.4 升级记录（2026-10-01）
 
@@ -269,26 +306,87 @@ Dockerfile 里的 torch 安装行。
 > 运行时分发，Dockerfile 里也有 `OPENCV_CPU_DISABLE` 兜底；rapidocr 本身纯 Python，
 > 推理走 onnxruntime（运行时分发）。其余与 v0.11.3 镜像一致。
 
-### 2. 主 Dockerfile 的上游重构（已与 Bonnell 段干净合并）
+> 注：本次实际部署的是 **slim** 变体（见下面第 2 节）——opencv / rapidocr / pyarrow /
+> tokenizers 都不会进镜像，所以上面那些原生二进制的风险不落到最终镜像上。
 
-- 新增 `USE_SLIM` 变体 + `backend/requirements-slim.txt`（不含 torch / pyarrow / tokenizers 等）；
+### 2. 改用 slim 镜像（本次的主要决定）
+
+上游 v0.11.4 新增了 `USE_SLIM` 变体 + `backend/requirements-slim.txt`（不含 torch /
+pyarrow / tokenizers / chromadb / playwright / unstructured / 云存储 SDK 等）。本 fork
+已改用这个形态，镜像里只剩 **numpy 一个需要 Bonnell 重编的包**（`numpy-2.4.6` 正好等于
+slim 里 pin 的版本），pyarrow / tokenizers / onnxruntime / opencv / torch / scipy /
+sklearn / ctranslate2 全部不进镜像，objdump 审计面基本清零。
+
+**Dockerfile 随之改动的两个地方：**
+
+```dockerfile
+# Bonnell 段：slim 下只装 numpy wheel，跳过 pyarrow/tokenizers + arrow-libs
+RUN set -e; \
+    if [ "$USE_SLIM" = "true" ]; then \
+    pip3 install --no-cache-dir --force-reinstall --no-deps /tmp/bonnell-wheels/numpy-*.whl; \
+    else ...三个 wheel + cp arrow-libs...; fi
+
+# 运行时库：libthrift/libutf8proc 是 libarrow 专用，slim 下不装
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libopenblas0 libre2-9 && \
+    if [ "$USE_SLIM" != "true" ]; then apt-get install -y --no-install-recommends libthrift-0.17.0 libutf8proc2; fi && ...
+```
+
+`libopenblas0` **必须留**：我们的 numpy wheel 是动态链接系统 `libopenblas.so.0` 的
+（`ldd numpy/_core/_multiarray_umath*.so` 可验证），`OPENBLAS_CORETYPE=BONNELL` 也就是
+作用于它。其余两个 ENV（`ARROW_USER_SIMD_LEVEL` / `OPENCV_CPU_DISABLE`）在 slim 里
+是空转，留着只为了完整镜像。
+
+#### slim 少了什么、用什么顶（部署前必须逐条落实）
+
+| 功能 | 远程替代 | 配置项 |
+|---|---|---|
+| 本地 embedding | ✅ openai / ollama / azure_openai | `RAG_EMBEDDING_ENGINE`（**默认空串=本地，必须显式改**） |
+| 本地 rerank（colbert） | ⚠️ 只能 external | `RAG_RERANKING_ENGINE=external` + `RAG_EXTERNAL_RERANKER_URL/API_KEY`；或清空 reranking model 退回 cosine |
+| 本地 Whisper STT | ✅ openai / deepgram / azure / mistral | `AUDIO_STT_ENGINE`。slim 强制 `BYPASS_PYDUB_PREPROCESSING=true`：**原始音频直接上传**，webm/opus 只有接受它的供应商才行；Mistral 那条路径硬限 mp3/wav |
+| 本地 TTS | ✅ openai / elevenlabs / azure / mistral | `AUDIO_TTS_ENGINE`（本地 `transformers` 引擎 503） |
+| 文档解析（PDF/DOCX/PPTX/XLSX/OCR） | ✅ tika / docling / document_intelligence / mistral_ocr / paddleocr_vl / datalab_marker / mineru / external | `CONTENT_EXTRACTION_ENGINE` + 对应 URL/key。本地只剩 txt/md/rst/xml/html/csv |
+| 网页抓取 | ✅ safe_web（默认，纯 HTTP）/ firecrawl / tavily / microsoft_web_iq / external | `WEB_LOADER_ENGINE`（只有 playwright 被砍） |
+| DuckDuckGo 搜索 | ✅ 换一家（其余 ~25 家都是 HTTP 实现） | searxng / brave / kagi / tavily / exa / serper / google_pse / perplexity / jina / mojeek / linkup / yandex / bing / searchapi / openserp / staan / bocha … |
+| 评估页语义聚类 | ✅ 用已配好的外部 embedding | 无额外配置 |
+
+**没有远程 API 等价物的 4 个硬缺口：**
+
+1. **云存储**：`STORAGE_PROVIDER` 只能 `local`（boto3 / GCS / Azure Blob 全砍），只能靠挂盘；
+2. **向量库只能 pgvector**：`factory.py` 里 `USE_SLIM and vector_type != PGVECTOR → 503`，远程 Chroma / Qdrant / Milvus 也一律拒，必须自备 Postgres+pgvector（`VECTOR_DB=pgvector` + `PGVECTOR_DB_URL`）；
+3. **RAG 分词器降级**：`RAG_TOKENIZER_MODEL`（transformers）在 slim 下 503，只能用 character/token 切分；
+4. **本地 rerank 无等价服务**，除非自己架一个外部 reranker HTTP 服务。
+
+还有两条约束：`USE_SLIM=true` 与 `USE_OLLAMA/USE_CUDA` 上游硬校验互斥（Ollama 得是独立容器）；
+主库只能是 SQLite / PostgreSQL。
+
+#### 本次构建实测（2026-10-01）
+
+| 项 | 结果 |
+|---|---|
+| 镜像体积 | **1.03 GB**（`open-webui:bonnell` 与 `open-webui:bonnell-slim` 指向同一 digest；完整镜像未建完，无对比数据） |
+| 前端构建 | `npm run build` 142 s 通过（`NODE_OPTIONS=--max-old-space-size=8192`） |
+| 包清单 | site-packages 共 175 个包；torch / pyarrow / tokenizers / onnxruntime / opencv / chromadb / playwright / rapidocr / transformers / scipy / pandas **均不存在** |
+| numpy | 2.4.6，自编 wheel，动态链接系统 `libopenblas.so.0`（`OPENBLAS_CORETYPE=BONNELL` 生效） |
+| 静态扫描 | numpy 全部 .so = **0** 条 v2 指令；新增的 `re2` 只命中 52 条 `tzcnt`（BMI1 的 `F3 0F BC` 编码，在不支持 BMI1 的 CPU 上按 `BSF` 解码 —— Bonnell 安全） |
+| 运行 | 容器 60 s 内 healthy；`/health` → `{"status":true}`；`/api/version` → `0.11.4`；`/api/config` → `features.slim: true` |
+| 遗留 | 仍未在 Atom D525 实机复测；且部署前必须配好外部 embedding / rerank / STT / TTS / 文档提取 / pgvector，否则对应功能直接 503 |
+
+### 3. 主 Dockerfile 的上游重构（已与 Bonnell 段干净合并）
+
+- 新增 `USE_SLIM` 变体 + `backend/requirements-slim.txt`；
 - pip 安装段改成 `RUN --mount=from=ghcr.io/astral-sh/uv:0.12.10,source=/uv,target=/bin/uv`，**需要 BuildKit**（现代 docker 默认开启）；
 - 构建阶段把 `chown/chgrp/chmod` 提前，后端改为 `COPY --from=build /app/backend .`；
 - 上游基础镜像仍写未定版的 `python:3.11-slim-bookworm`，本 fork 保持 pin 到 `3.11.14`，与 4 个 bonnell builder 的 `BASE_IMAGE` 对齐。
 
-> **不要用 `--build-arg USE_SLIM=true` 构建 Bonnell 镜像。** slim 变体既不装
-> pyarrow/tokenizers，也不装 git/pandoc/ffmpeg，本 fork 没做适配；而 Bonnell 段会无条件
-> `--force-reinstall` 那三个 wheel，和 slim 的意图直接冲突。
-
-### 3. v1 兼容性：待实机复测
+### 4. v1 兼容性：待实机复测
 
 v0.11.4 升级当天只做了合并 + 静态审计（AST 扫依赖、`compileall`、requirements 与
-上游逐行对齐），**尚未在 Atom D525 上跑过**。下次上机按 v0.11.3 那节的三步复查：
+上游逐行对齐），**尚未在 Atom D525 上跑过**。slim 下要复查的东西比完整镜像少得多：
 
-1. 静态 `objdump` 扫描（这次要确认新增的 opencv-python-headless —— 预期含 AVX2，
-   但由 `OPENCV_CPU_DISABLE` 关闭）；
-2. 逐模块独立进程 `import`，确认没有 rc=132（SIGILL）；
-3. 真算一遍 numpy / torch / pyarrow / tiktoken，再起容器验 `/health` 与 `/api/version`。
+1. 静态 `objdump` 扫描 —— 预期只剩 numpy（自编，应为 0 条 v2 指令）与少量纯 Python/wheel 自带的 .so；
+2. 逐模块独立进程 `import numpy` + 真算一遍矩阵乘（numpy 之外的 torch/pyarrow 已不在镜像里）；
+3. 起容器验 `/health` 与 `/api/version`，并逐项确认上面的远程替代已配好（否则会直接 503）。
 
 ## 版本升级注意事项
 
@@ -297,21 +395,25 @@ v0.11.4 升级当天只做了合并 + 静态审计（AST 扫依赖、`compileall
 | Python 版本 | 所有 `Dockerfile.build-*` 的 `BASE_IMAGE` arg 必须与主 Dockerfile base 一致 | 当前 `python:3.11.14-slim-bookworm` |
 | Arrow C++ | `Dockerfile.build-pyarrow` 的 `ARROW_VERSION` build arg | 必须与 requirements.txt 中 pyarrow 版本一致 |
 | onnxruntime | `Dockerfile.build-onnxruntime` 的 `ORT_VERSION` build arg | 必须与 requirements.txt 中 onnxruntime 版本一致 |
-| numpy / tokenizers | 不锁定版本，自动构建兼容版 | 主 Dockerfile 用 glob 匹配，无需修改；但先用 `grep -A2 '^name = "numpy"' uv.lock` 确认上游解析到的版本，看 `bonnell-wheels/` 里的 wheel 是否对得上 |
-| wheel 与 `uv pip install` 的版本一致 | pyarrow / onnxruntime 在 requirements.txt 里 pin，numpy / tokenizers 由解析决定 | Bonnell 段用 `--force-reinstall --no-deps` 覆盖前三个，只换二进制不改依赖图，版本差异过大可能 ABI 不匹配 |
+| numpy / tokenizers | 不锁定版本，自动构建兼容版 | 主 Dockerfile 用 glob 匹配，无需修改；但先用 `grep -A2 '^name = "numpy"' uv.lock` 确认上游解析到的版本，看 `bonnell-wheels/` 里的 wheel 是否对得上。**slim 下唯一会进镜像的就是 numpy**，所以这个对齐最要紧 |
+| wheel 与 `uv pip install` 的版本一致 | pyarrow / onnxruntime 在 requirements.txt 里 pin，numpy / tokenizers 由解析决定 | Bonnell 段用 `--force-reinstall --no-deps` 覆盖，只换二进制不改依赖图；slim 只覆盖 numpy。版本差异过大可能 ABI 不匹配 |
+| slim 的依赖清单 | `backend/requirements-slim.txt` 由上游维护，与本 fork 的 `requirements.txt` 差异无关 | 升级时比对 `comm -23 <(sort requirements.txt) <(sort requirements-slim.txt)` 看新增/移除了什么 |
 | wheel 文件名中的 `cp311` | Python 大版本变了要更新 | 如 Python 3.12 → `cp312` |
 | 运行时库包名 | `libre2-9`、`libthrift-0.17.0` | Debian bookworm 的 `apt-cache search` 检查 |
 | pyarrow `__version__ = None` 修复 | 自动从 wheel 文件名提取版本并 sed | 如果 Arrow 修了 shallow clone 版本问题可去除此段 |
 
 ## 运行时 SIMD 控制总结
 
+当前镜像为 slim：下表里 **ARROW / OPENCV 两行是空转**（对应包不在镜像里），
+`NPY_DISABLE_CPU_FEATURES` 与 `OPENBLAS_CORETYPE` 依然生效且关键。
+
 | 环境变量 | 控制范围 | Bonnell 设置 |
 |---|---|---|
-| `OPENBLAS_CORETYPE` | OpenBLAS（scipy/numpy 的 BLAS） | `BONNELL` |
-| `ARROW_USER_SIMD_LEVEL` | Arrow C++ CPU dispatch | `NONE` |
-| `OPENCV_CPU_DISABLE` | OpenCV 多架构 dispatch | `AVX2,AVX,SSE4.2,SSE4.1,SSSE3,SSE3` |
+| `OPENBLAS_CORETYPE` | OpenBLAS（numpy 的 BLAS；slim 下唯一相关项） | `BONNELL` |
+| `ARROW_USER_SIMD_LEVEL` | Arrow C++ CPU dispatch（**slim 下无此包**） | `NONE` |
+| `OPENCV_CPU_DISABLE` | OpenCV 多架构 dispatch（**slim 下无此包**） | `AVX2,AVX,SSE4.2,SSE4.1,SSSE3,SSE3` |
 | `NPY_DISABLE_CPU_FEATURES` | numpy CPU feature 检测 | `AVX,AVX2,AVX512F,FMA3,FMA4,SSE4_1,SSE4_2,POPCNT` |
-| Rust `is_x86_feature_detected!` | tokenizers, chromadb, hf_xet 等 | 运行时自动检测，Bonnell 回退 scalar |
+| Rust `is_x86_feature_detected!` | tokenizers / chromadb / hf_xet 等（**slim 下均不在**） | 运行时自动检测，Bonnell 回退 scalar |
 
 ## 依赖增删记录（累计，已按 v0.11.4 复核）
 
